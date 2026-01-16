@@ -1,0 +1,6 @@
+outs:
+- md5: 036820b0048de6fdccee2ae849af0f2d.dir
+  size: 12608504
+  nfiles: 27
+  hash: md5
+  path: data_lake

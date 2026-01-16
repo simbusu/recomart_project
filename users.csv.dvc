@@ -1,0 +1,6 @@
+outs:
+- md5: 503f5b8682e7b9e4efe44ef056f54399
+  size: 751174
+  isexec: true
+  hash: md5
+  path: users.csv
