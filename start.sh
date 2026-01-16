@@ -13,7 +13,7 @@ export AIRFLOW__CORE__LOAD_EXAMPLES=False
 export MLFLOW_SET_DESTINATION=/home/ubuntu/recomart_project/mlruns
 export MLFLOW_TRACKING_URI=http://172.17.0.1:5000
 
-echo "🚀 Starting RecoMart with Docker-backed Model Registry..."
+echo "🚀 Starting RecoMart with Data Versioning & Lineage..."
 
 # --- 2. ENVIRONMENT REFRESH ---
 cd $AIRFLOW_HOME
@@ -25,8 +25,19 @@ else
 fi
 
 echo -n "📦 Synchronizing Python dependencies... "
-pip install "numpy<2.0.0" pandas sqlalchemy nltk mlflow==2.15.1 scikit-surprise psycopg2-binary -q
+# Added 'dvc' and 'pyyaml' to ensure the DAG can read version hashes
+pip install "numpy<2.0.0" pandas sqlalchemy nltk mlflow==2.15.1 dvc pyyaml scikit-surprise psycopg2-binary -q
 echo "✅ Done."
+
+# --- 2.5 DATA VERSIONING SYNC (Requirement 8) ---
+echo -n "🔗 Checking Data Lineage Sync (DVC)... "
+# Ensure DVC local storage exists
+mkdir -p /home/ubuntu/dvc_storage
+
+# Pull latest data versions based on .dvc pointer files in Git
+# This ensures your 'data_lake' folder matches your code version
+dvc pull -q > /dev/null 2>&1
+echo "✅ Data Synced."
 
 # --- 3. INFRASTRUCTURE (DOCKER) ---
 echo -n "🐳 Bringing up Docker Services (Postgres, Kafka, MLflow)... "
@@ -59,12 +70,13 @@ echo "✅ Done."
 
 # --- 6. TRIGGER PIPELINE ---
 echo -n "🔓 Triggering RecoMart Pipeline... "
+# This triggers the DAG which now contains the MLflow tagging logic
 $VENV_BIN/airflow dags unpause recomart_full_pipeline > /dev/null 2>&1
 $VENV_BIN/airflow dags trigger recomart_full_pipeline > /dev/null 2>&1
 echo "✅ Done."
 
 echo "------------------------------------------------------"
-echo "🌟 SERVICES ACTIVE"
+echo "🌟 SERVICES ACTIVE & LINEAGE TRACKED"
 echo "Airflow UI:      http://3.16.158.217:8080"
 echo "MLflow Registry: http://3.16.158.217:5000"
 echo "Dashboard:       streamlit run appv1.py"

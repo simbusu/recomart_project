@@ -6,6 +6,8 @@ import time
 import pandas as pd
 import mlflow
 import numpy as np
+import subprocess
+import yaml
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -29,9 +31,9 @@ if os.path.exists('/.dockerenv') or os.path.exists('/opt/airflow'):
     MLFLOW_URI = "http://mlflow:5000"
 else:
     DB_URL = "postgresql+psycopg2://airflow:airflow@localhost:5432/airflow"
-    LAKE_ROOT = "data_lake"
+    LAKE_ROOT = os.path.expanduser("~/recomart_project/data_lake")
     NLTK_DATA_DIR = os.path.expanduser("~/recomart_project/nltk_data")
-    MODEL_DIR = "models"
+    MODEL_DIR = os.path.expanduser("~/recomart_project/models")
     MLFLOW_URI = "http://172.17.0.1:5000"
 
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -60,7 +62,7 @@ def run_product_sync():
 
 def cleanup_data_lake():
     now = time.time()
-    retention_period = 2 * 24 * 60 * 60 
+    retention_period = 2 * 24 * 60 * 60
     count = 0
     for root, dirs, files in os.walk(LAKE_ROOT):
         for name in files:
@@ -78,7 +80,7 @@ def validate_lake_data(**kwargs):
         raise ValueError("❌ Validation Failed: No event data found in lake.")
     logger.info(f"✅ Validation Passed: Found {len(found_files)} files.")
 
-# --- 3. PREPARATION & SENTIMENT ---
+# --- 3. PREPARATION & SENTIMENT (WITH DVC VERSIONING) ---
 def prepare_and_stage_data(**kwargs):
     import nltk
     from nltk.sentiment.vader import SentimentIntensityAnalyzer
@@ -102,6 +104,34 @@ def prepare_and_stage_data(**kwargs):
         df['rating'] = pd.to_numeric(df['rating'], errors='coerce').fillna(3.0).clip(1.0, 5.0)
         df['sentiment'] = df['review_text'].apply(lambda x: sid.polarity_scores(str(x))['compound'] if x else 0.0)
         df = df.drop_duplicates(subset=['user_id', 'product_id'], keep='last')
+
+        # --- REQUIREMENT 8: DVC VERSIONING ---
+        versioned_csv = os.path.join(LAKE_ROOT, "transformed_ratings.csv")
+        df.to_csv(versioned_csv, index=False)
+
+        data_hash = "unknown_hash"
+        try:
+            # Locate DVC binary in the current venv
+            dvc_bin = os.path.join(os.path.dirname(sys.executable), 'dvc')
+            
+            # Since data_lake/ is tracked, we update the whole folder
+            subprocess.run([dvc_bin, "add", LAKE_ROOT], check=True, capture_output=True)
+            
+            # Read hash from data_lake.dvc (parent of versioned_csv)
+            dvc_pointer = os.path.join(os.path.dirname(LAKE_ROOT), "data_lake.dvc")
+            
+            if os.path.exists(dvc_pointer):
+                with open(dvc_pointer, "r") as f:
+                    dvc_config = yaml.safe_load(f)
+                    data_hash = dvc_config['outs'][0]['md5']
+                logger.info(f"✅ DVC Versioning Successful: {data_hash}")
+            else:
+                logger.error(f"❌ DVC Pointer file not found: {dvc_pointer}")
+        except Exception as e:
+            logger.error(f"⚠️ DVC Error: {str(e)}")
+
+        kwargs['ti'].xcom_push(key='dvc_data_hash', value=data_hash)
+
         engine = create_engine(DB_URL)
         df[['product_id', 'user_id', 'rating', 'sentiment']].to_sql(
             'temp_lake_ratings_raw', engine, if_exists='replace', index=False
@@ -109,77 +139,50 @@ def prepare_and_stage_data(**kwargs):
     else:
         logger.warning("No reviews found to stage.")
 
-# --- 4. DECOUPLED ML TRAINING & REGISTRY ---
-def train_collaborative_model():
-    from surprise import SVD, Dataset, Reader, dump
+# --- 4. ML TRAINING & METADATA LINEAGE ---
+def train_collaborative_model(**kwargs):
+    from surprise import SVD, Dataset, Reader
     from surprise.model_selection import cross_validate
     from mlflow.tracking import MlflowClient
     import mlflow.sklearn
 
-    # 1. Environment Setup
+    ti = kwargs['ti']
+    dvc_hash = ti.xcom_pull(key='dvc_data_hash', task_ids='process_sentiment_scores') or "unknown_hash"
+
     mlflow.set_tracking_uri(MLFLOW_URI)
     mlflow.set_experiment("RecoMart_V3_System")
     engine = create_engine(DB_URL)
-    
+
     try:
         df = pd.read_sql("SELECT user_id, product_id, rating FROM temp_lake_ratings_raw", engine)
 
         if len(df) > 5:
             run_name = f"SVD_Run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             with mlflow.start_run(run_name=run_name) as run:
-                # Surprise Training
                 reader = Reader(rating_scale=(1, 5))
                 data = Dataset.load_from_df(df[['user_id', 'product_id', 'rating']], reader)
                 algo = SVD()
                 algo.fit(data.build_full_trainset())
 
-                # Metrics calculation
                 cv_results = cross_validate(algo, data, measures=['RMSE'], cv=3)
                 mean_rmse = np.mean(cv_results['test_rmse'])
-                precision_score = max(0.6, 1.0 - (mean_rmse / 5.0))
-
-                # Log Params & Metrics
-                mlflow.log_param("model_type", "SVD")
-                mlflow.log_metric("precision_at_5", precision_score)
                 mlflow.log_metric("rmse", mean_rmse)
 
-                # --- NEW DECOUPLED METADATA TRACKING ---
-                # A. Log Model Artifact
-                mlflow.sklearn.log_model(sk_model=algo, artifact_path="svd-model")
-                
-                # B. Track Data Provenance Tags
-                mlflow.set_tag("data_source", "temp_lake_ratings_raw")
+                # --- REQUIREMENT 8: METADATA TRACKING (LINEAGE) ---
+                mlflow.set_tag("data_source", "Kafka-Data-Lake/Transformed-CSV")
                 mlflow.set_tag("ingestion_date", datetime.now().strftime("%Y-%m-%d"))
+                mlflow.set_tag("transformations", "Vader-Sentiment, Rating-Clipping, Deduplication")
+                mlflow.set_tag("dvc_hash", dvc_hash)
 
-                # C. Formally Register using URI
-                model_uri = f"runs:/{run.info.run_id}/svd-model"
+                mlflow.sklearn.log_model(sk_model=algo, artifact_path="svd-model")
+
                 model_name = "RecoMart_SVD_Model"
-                mv = mlflow.register_model(model_uri, model_name)
+                mv = mlflow.register_model(f"runs:/{run.info.run_id}/svd-model", model_name)
 
-                # D. Add tags to the Model Version in the Registry
                 client = MlflowClient()
-                client.set_model_version_tag(
-                    name=model_name,
-                    version=mv.version,
-                    key="data_origin",
-                    value="transformed_batch_etl"
-                )
+                client.set_model_version_tag(model_name, mv.version, "data_lineage", dvc_hash)
+                logger.info(f"✅ Model Registered with Data Lineage: {dvc_hash}")
 
-                # Export Dashboard Bridge
-                metrics_summary = {
-                    "precision": round(precision_score, 2),
-                    "recall": 0.76,
-                    "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                with open(os.path.join(MODEL_DIR, "latest_metrics.json"), "w") as f:
-                    json.dump(metrics_summary, f)
-
-                # Legacy local save
-                dump.dump(os.path.join(MODEL_DIR, "svd_v1.pkl"), algo=algo)
-
-                logger.info(f"✅ ML Model Registered: {model_name} Version {mv.version}")
-        else:
-            logger.warning("Insufficient data for training.")
     except Exception as e:
         logger.error(f"❌ ML Training error: {str(e)}")
 
@@ -208,7 +211,6 @@ def transform_to_feature_store():
     with engine.begin() as conn:
         conn.execute(upsert_query)
 
-# --- 6. CONTENT SIMILARITY ---
 def generate_content_similarity():
     import pickle
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -228,8 +230,7 @@ with DAG(
     default_args=default_args,
     schedule='@daily',
     catchup=False,
-    is_paused_upon_creation=False,
-    tags=['recomart', 'mlops', 'metadata']
+    tags=['recomart', 'mlops', 'lineage']
 ) as dag:
 
     initialize_database = PythonOperator(task_id='initialize_database', python_callable=setup_database)

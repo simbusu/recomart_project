@@ -21,53 +21,45 @@ else:
 
 engine = create_engine(DB_URL)
 
-# --- 1. DATA QUALITY & EDA HELPERS (Integrated from standalone scripts) ---
+# --- 1. DATA HELPERS ---
 def get_data_health_metrics():
-    """Logic from dq_reporter.py and eda_analysis.py integrated for live reporting."""
     try:
         df_ratings = pd.read_sql("SELECT * FROM temp_lake_ratings_raw", engine)
-        if df_ratings.empty:
-            return None
-        
-        # DQ Checks
+        if df_ratings.empty: return None, pd.DataFrame()
         dq_stats = {
             "total_records": len(df_ratings),
             "missing_values": df_ratings.isnull().sum().sum(),
             "duplicates": df_ratings.duplicated().sum(),
-            "range_errors": len(df_ratings[(df_ratings['rating'] < 1) | (df_ratings['rating'] > 5)]),
             "unique_users": df_ratings['user_id'].nunique(),
             "unique_items": df_ratings['product_id'].nunique()
         }
-        
-        # Sparsity Logic
         sparsity = (1 - (dq_stats['total_records'] / (dq_stats['unique_users'] * dq_stats['unique_items']))) * 100
         dq_stats['matrix_sparsity'] = round(sparsity, 2)
-        
         return dq_stats, df_ratings
-    except:
-        return None, pd.DataFrame()
+    except: return None, pd.DataFrame()
 
 def get_mlflow_history():
-    """Queries MLflow for historical trends and metadata tags."""
     if os.path.exists(MLFLOW_DB):
         try:
             conn = sqlite3.connect(MLFLOW_DB)
             query = """
-            SELECT r.run_uuid, m.key, m.value, r.start_time, t.value as data_source
+            SELECT r.run_uuid, m.key, m.value, r.start_time, 
+                   t1.value as data_source, t2.value as dvc_hash
             FROM metrics m
             JOIN runs r ON m.run_uuid = r.run_uuid
-            LEFT JOIN tags t ON r.run_uuid = t.run_uuid AND t.key = 'data_source'
-            ORDER BY r.start_time DESC
+            LEFT JOIN tags t1 ON r.run_uuid = t1.run_uuid AND t1.key = 'data_source'
+            LEFT JOIN tags t2 ON r.run_uuid = t2.run_uuid AND t2.key = 'dvc_hash'
+            WHERE r.status = 'FINISHED'
+            ORDER BY r.start_time ASC
             """
             df = pd.read_sql(query, conn)
             conn.close()
             if df.empty: return pd.DataFrame()
             df['date'] = pd.to_datetime(df['start_time'], unit='ms')
-            pivot_df = df.pivot_table(index=['date', 'data_source', 'run_uuid'], columns='key', values='value').reset_index()
-            return pivot_df.sort_values('date', ascending=False)
-        except Exception as e:
-            st.sidebar.error(f"MLflow DB Query Error: {e}")
-            return pd.DataFrame()
+            df['key'] = df['key'].str.lower().str.strip()
+            return df.pivot_table(index=['date', 'data_source', 'dvc_hash', 'run_uuid'], 
+                                  columns='key', values='value').reset_index()
+        except: return pd.DataFrame()
     return pd.DataFrame()
 
 def load_performance_metrics():
@@ -79,68 +71,21 @@ def load_performance_metrics():
     return None
 
 # --- DASHBOARD SETUP ---
-st.set_page_config(page_title="RecoMart V3 AI Console", layout="wide", page_icon="🚀")
+st.set_page_config(page_title="RecoMart V3 Console", layout="wide", page_icon="🚀")
 st.title("🚀 RecoMart V3: Production Intelligence")
 
 # --- TOP LEVEL METRIC CARDS ---
 metrics = load_performance_metrics()
+h_df = get_mlflow_history()
 k1, k2, k3, k4 = st.columns(4)
+
 if metrics:
     k1.metric("Current Precision", f"{metrics.get('precision', 0)*100:.1f}%")
     k2.metric("Current Recall", f"{metrics.get('recall', 0)*100:.1f}%")
     k3.metric("Last Training Sync", str(metrics.get('last_run', 'N/A')).split(" ")[0])
-    k4.metric("Model Status", "Healthy ✅")
+    k4.metric("Model Status", "Healthy ✅" if metrics.get('rmse', 2) < 1.45 else "Drift ⚠️")
 
 st.divider()
-
-# --- MAIN DASHBOARD TABS ---
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Business EDA", "📉 Model Drift Tracker", "⚡ Conversion Funnel", "🔍 Data Health & DQ"])
-
-with tab1:
-    st.subheader("Sentiment vs. Revenue Analysis")
-    try:
-        df_eda = pd.read_sql("SELECT p.product_name, pfs.total_sales, pfs.avg_sentiment, pfs.review_count, p.category FROM product_feature_store pfs JOIN products p ON pfs.product_id = p.product_id", engine)
-        fig = px.scatter(df_eda, x="avg_sentiment", y="total_sales", size="review_count", color="category", hover_name="product_name")
-        st.plotly_chart(fig, use_container_width=True)
-    except: st.info("Run the ETL pipeline to see Business EDA.")
-
-with tab2:
-    st.subheader("MLflow Performance History")
-    h_df = get_mlflow_history()
-    if not h_df.empty:
-        m_cols = [c for c in h_df.columns if c not in ['date', 'data_source', 'run_uuid']]
-        fig_drift = px.line(h_df, x='date', y=m_cols, markers=True, title="Model Accuracy Trends")
-        st.plotly_chart(fig_drift, use_container_width=True)
-    else: st.info("No MLflow history detected.")
-
-with tab3:
-    st.subheader("Real-time Clickstream Journey")
-    try:
-        df_logs = pd.read_sql("SELECT event_type, count(*) as volume FROM clickstream_logs GROUP BY event_type", engine)
-        fig_f = go.Figure(go.Funnel(y=df_logs['event_type'], x=df_logs['volume']))
-        st.plotly_chart(fig_f, use_container_width=True)
-    except: st.info("Clickstream table not found yet.")
-
-with tab4:
-    st.subheader("Data Integrity & Distribution")
-    dq_stats, df_r = get_data_health_metrics()
-    if dq_stats:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Ratings", dq_stats['total_records'])
-        c2.metric("Missing Values", dq_stats['missing_values'], delta_color="inverse")
-        c3.metric("Duplicates", dq_stats['duplicates'], delta_color="inverse")
-        c4.metric("Matrix Sparsity", f"{dq_stats['matrix_sparsity']}%")
-        
-        st.divider()
-        col_dist, col_pop = st.columns(2)
-        with col_dist:
-            st.write("**Rating Distribution**")
-            st.plotly_chart(px.histogram(df_r, x='rating', nbins=5), use_container_width=True)
-        with col_pop:
-            st.write("**Top 10 Product Popularity**")
-            top10 = df_r['product_id'].value_counts().head(10).reset_index()
-            st.plotly_chart(px.bar(top10, x='product_id', y='count'), use_container_width=True)
-    else: st.info("Staged data not found. Run the Airflow pipeline.")
 
 # --- SIDEBAR: PERSONALIZATION & LINEAGE ---
 st.sidebar.header("🎯 AI Personalization")
@@ -151,17 +96,84 @@ try:
         m_path = os.path.join(MODEL_ROOT, "svd_v1.pkl")
         if os.path.exists(m_path):
             _, algo = dump.load(m_path)
-            prods = pd.read_sql("SELECT p.product_id, p.product_name, f.avg_sentiment FROM products p LEFT JOIN product_feature_store f ON p.product_id = f.product_id", engine)
+            prods = pd.read_sql("""
+                SELECT p.product_id, p.product_name, f.avg_sentiment 
+                FROM products p 
+                LEFT JOIN product_feature_store f ON p.product_id = f.product_id
+            """, engine)
             prods['score'] = prods.apply(lambda x: (algo.predict(str(sel_user), str(x['product_id'])).est * 0.7) + ((x['avg_sentiment'] or 0) * 0.3), axis=1)
+            st.sidebar.write(f"**Top Picks for {sel_user}:**")
             st.sidebar.table(prods.sort_values('score', ascending=False).head(5)[['product_name', 'score']])
-except: st.sidebar.info("Sync users/models to enable personalization.")
+        else:
+            st.sidebar.error("Model file `svd_v1.pkl` not found.")
+except:
+    st.sidebar.info("Sync users to enable personalization.")
 
 st.sidebar.divider()
-st.sidebar.subheader("📜 Model Lineage (MLflow)")
-h_df = get_mlflow_history()
+st.sidebar.header("🛡️ Model Lineage")
 if not h_df.empty:
-    latest = h_df.iloc[0]
-    with st.sidebar.expander("Latest Version Info", expanded=True):
-        st.write(f"**Source:** `{latest.get('data_source', 'N/A')}`")
-        st.write(f"**RMSE:** `{latest.get('rmse', 0):.4f}`")
-        st.caption(f"Run ID: {latest.get('run_uuid', 'N/A')[:8]}")
+    latest = h_df.iloc[-1]
+    st.sidebar.success(f"**DVC Hash:**\n`{latest.get('dvc_hash', 'N/A')[:12]}`")
+    st.sidebar.caption(f"**Source:** {latest.get('data_source', 'N/A')}")
+
+# --- MAIN DASHBOARD TABS ---
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Business EDA", "📉 Model Drift", "⚡ Funnel", "🔍 Data Health", "📜 Audit Log"])
+
+with tab1:
+    st.subheader("🏙️ Product Sentiment vs. Revenue Analysis")
+    try:
+        df_eda = pd.read_sql("""
+            SELECT p.product_name, pfs.total_sales, pfs.avg_sentiment, pfs.review_count, p.category 
+            FROM product_feature_store pfs 
+            JOIN products p ON pfs.product_id = p.product_id
+        """, engine)
+        
+        if not df_eda.empty:
+            fig = px.scatter(
+                df_eda, 
+                x="avg_sentiment", 
+                y="total_sales", 
+                size="review_count", 
+                color="category", 
+                hover_name="product_name",
+                title="Revenue Drivers: Sentiment & Sales",
+                template="plotly_dark"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No data in Feature Store.")
+    except:
+        st.info("Run the ETL pipeline to sync the Feature Store for Sentiment analysis.")
+
+with tab2:
+    st.subheader("📉 Model Performance Tracking")
+    if not h_df.empty:
+        fig_drift = px.line(h_df, x='date', y='rmse', markers=True, title="RMSE Trend", template="plotly_dark")
+        fig_drift.add_hline(y=1.45, line_dash="dot", line_color="red", annotation_text="Drift Limit")
+        st.plotly_chart(fig_drift, use_container_width=True)
+    else: st.info("No MLflow history.")
+
+with tab3:
+    st.subheader("⚡ Conversion Funnel")
+    try:
+        df_logs = pd.read_sql("SELECT event_type, count(*) as volume FROM clickstream_logs GROUP BY event_type", engine)
+        fig_f = go.Figure(go.Funnel(y=df_logs['event_type'], x=df_logs['volume']))
+        st.plotly_chart(fig_f, use_container_width=True)
+    except: st.info("Clickstream data missing.")
+
+with tab4:
+    st.subheader("🔍 Data Health")
+    dq, df_r = get_data_health_metrics()
+    if dq:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Records", dq['total_records'])
+        c2.metric("Matrix Sparsity", f"{dq['matrix_sparsity']}%")
+        c3.metric("Duplicates", dq['duplicates'])
+        st.plotly_chart(px.histogram(df_r, x='rating', title="Rating Distribution"), use_container_width=True)
+
+with tab5:
+    st.subheader("📜 Audit Log")
+    if not h_df.empty:
+        history = h_df.sort_values('date', ascending=False).head(5).copy()
+        history['RMSE'] = history['rmse'].map('{:,.4f}'.format)
+        st.table(history[['date', 'dvc_hash', 'run_uuid', 'RMSE']])
