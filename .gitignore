@@ -1,0 +1,11 @@
+venv/
+logs/
+__pycache__/
+*.log
+*.db
+*.db-shm
+*.db-wal
+nohup.out
+airflow-webserver.pid
+standalone_admin_password.txt
+nltk_data/
