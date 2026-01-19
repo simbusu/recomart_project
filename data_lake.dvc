@@ -1,6 +1,6 @@
 outs:
-- md5: fd87a910cbbdda286502519b4ca8ae49.dir
-  nfiles: 151
+- md5: c5825ce972f5f9723170712a127bdc31.dir
+  nfiles: 139
   hash: md5
   path: data_lake
-  size: 40891803
+  size: 37617274

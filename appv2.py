@@ -4,8 +4,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import json
 import os
-import sqlite3
-import subprocess
 from sqlalchemy import create_engine
 from surprise import dump
 
@@ -13,7 +11,7 @@ from surprise import dump
 if os.path.exists('/.dockerenv') or os.path.exists('/opt/airflow'):
     DB_URL = "postgresql+psycopg2://airflow:airflow@postgres:5432/airflow"
     MODEL_ROOT = "/opt/airflow/models"
-    MLFLOW_URL = "http://localhost:5000" # URL for clicking through to MLflow
+    MLFLOW_URL = "http://localhost:5000" 
 else:
     DB_URL = "postgresql+psycopg2://airflow:airflow@localhost:5432/airflow"
     MODEL_ROOT = os.path.expanduser("~/recomart_project/models")
@@ -31,11 +29,9 @@ def get_live_inventory_stats():
     except: return 0, 0, 0
 
 def get_detailed_metrics():
-    """Pulls Metrics + MLflow Run ID + DVC Data Hash."""
     try:
-        # Added mlflow_run_id and data_hash to the selection
         query = """
-            SELECT training_date as date, rmse, precision, recall, f1_score, 
+            SELECT training_date as date, rmse, precision, recall, f1_score,
                    mlflow_run_id, data_hash, model_version
             FROM model_health_logs
             ORDER BY training_date ASC
@@ -67,7 +63,7 @@ def get_feature_store_data():
         """, engine)
     except: return pd.DataFrame()
 
-# --- 3. DASHBOARD UI ---
+# --- 3. DASHBOARD UI SETUP ---
 st.set_page_config(page_title="RecoMart V3 MLOps Console", layout="wide", page_icon="🚀")
 st.title("🚀 RecoMart V3: MLOps & Lineage Intelligence")
 
@@ -76,20 +72,18 @@ n_u, n_p, n_r = get_live_inventory_stats()
 sparsity = round((1 - (n_r / (n_u * n_p if n_u*n_p > 0 else 1))) * 100, 2)
 metrics_df = get_detailed_metrics()
 
-# Main Row Metrics
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Catalog Users", f"{n_u:,}")
 m2.metric("Total Products", f"{n_p:,}")
 m3.metric("Live Interactions", f"{n_r:,}")
 m4.metric("Matrix Sparsity", f"{sparsity}%")
 
-# Sub-Row Metrics (Precision & Recall)
 if not metrics_df.empty:
     latest = metrics_df.iloc[-1]
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Model Precision", f"{round(latest['precision']*100, 2)}%")
     s2.metric("Model Recall", f"{round(latest['recall']*100, 2)}%")
-    s1.caption(f"Data Hash: `{latest['data_hash']}`") # Lineage Indicator
+    s1.caption(f"Latest Data Hash: `{latest['data_hash'][:12]}...`") 
     s2.caption(f"Run ID: `{latest['mlflow_run_id'][:8] if latest['mlflow_run_id'] else 'N/A'}`")
 
 st.divider()
@@ -106,6 +100,8 @@ try:
             prods = pd.read_sql("SELECT p.product_id, p.product_name, f.avg_sentiment FROM products p LEFT JOIN product_feature_store f ON p.product_id = f.product_id", engine)
             prods['score'] = prods.apply(lambda x: (algo.predict(str(sel_user), str(x['product_id'])).est * 0.7) + ((x['avg_sentiment'] or 0) * 0.3), axis=1)
             st.sidebar.table(prods.sort_values('score', ascending=False).head(5)[['product_name', 'score']])
+        else:
+            st.sidebar.error("Model file not found in /models")
 except: st.sidebar.info("Sync users to enable AI picks.")
 
 # --- 4. MAIN DASHBOARD TABS ---
@@ -114,7 +110,6 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "⚡ Live Funnel", "🔍 Data Health", "📜 MLOps Audit"
 ])
 
-# (Tabs 1-5 remain identical to your original code for stability)
 with tab1:
     st.subheader("🏙️ Strategic Sentiment & Revenue Analysis")
     df_eda = get_feature_store_data()
@@ -134,7 +129,7 @@ with tab3:
     if not metrics_df.empty:
         st.plotly_chart(px.line(metrics_df, x='date', y=['precision', 'recall'], markers=True, template="plotly_dark"), use_container_width=True)
         fig_drift = px.area(metrics_df, x='date', y='rmse', template="plotly_dark")
-        fig_drift.add_hline(y=1.45, line_dash="dot", line_color="red")
+        fig_drift.add_hline(y=1.45, line_dash="dot", line_color="red", annotation_text="SLA Limit")
         st.plotly_chart(fig_drift, use_container_width=True)
 
 with tab4:
@@ -145,29 +140,53 @@ with tab4:
     except: st.info("No Clickstream data found.")
 
 with tab5:
-    st.subheader("🔍 Data Health & Sparsity")
+    st.subheader("🔍 Data Health & Distribution")
     df_health = pd.read_sql("SELECT rating FROM reviews", engine)
     if not df_health.empty:
-        st.plotly_chart(px.histogram(df_health, x='rating', template="plotly_dark", nbins=5), use_container_width=True)
+        st.plotly_chart(px.histogram(df_health, x='rating', template="plotly_dark", nbins=5, title="Rating Frequency Distribution"), use_container_width=True)
 
-# --- UPDATED TAB 6: MLOps Audit with Lineage ---
+# --- TAB 6: MLOps Audit with Visual Lineage ---
 with tab6:
-    st.subheader("📜 MLOps Lineage Audit Log")
+    st.subheader("📜 MLOps Lineage Audit & Provenance")
+    
     if not metrics_df.empty:
-        # Create a display-friendly dataframe
+        # 1. VISUAL LINEAGE GRAPH (Sankey)
+        latest = metrics_df.iloc[-1]
+        
+        # Connect nodes: Kafka (0) -> DVC Hash (1) -> Model Version (2)
+        label = ["Kafka Data Lake", f"DVC: {latest['data_hash'][:8]}", f"Model: {latest['model_version']}"]
+        fig_lineage = go.Figure(data=[go.Sankey(
+            node = dict(
+              pad = 15, thickness = 20,
+              line = dict(color = "black", width = 0.5),
+              label = label,
+              color = ["#636EFA", "#EF553B", "#00CC96"]
+            ),
+            link = dict(
+              source = [0, 1], target = [1, 2], value = [100, 100],
+              color = "rgba(100, 100, 100, 0.4)"
+            ))])
+        
+        fig_lineage.update_layout(title_text="Data Provenance Flow (Source to Production)", font_size=12, template="plotly_dark")
+        st.plotly_chart(fig_lineage, use_container_width=True)
+
+        # 2. AUDIT TABLE
+        st.write("#### 🧪 Versioning History")
         audit_df = metrics_df.copy().sort_values('date', ascending=False)
-        
-        # Add a "View in MLflow" Link column
-        audit_df['mlflow_link'] = audit_df['mlflow_run_id'].apply(
-            lambda x: f"{MLFLOW_URL}/#/experiments/1/runs/{x}" if x else "N/A"
-        )
-        
-        st.write("#### 🧪 Model Versioning & Data Provenance")
         st.dataframe(
             audit_df[['date', 'model_version', 'rmse', 'precision', 'recall', 'data_hash', 'mlflow_run_id']],
             use_container_width=True
         )
-        
-        st.info("💡 The **Data Hash** represents the DVC snapshot used for training. The **Run ID** links to the full MLflow artifact registry.")
+
+        # 3. ROLLBACK PREVIEW
+        st.divider()
+        st.warning("🚨 **Emergency Control**")
+        if st.button("Simulate Rollback to Previous Version"):
+            if len(audit_df) > 1:
+                prev_hash = audit_df.iloc[1]['data_hash']
+                st.error(f"Rollback initiated. Target DVC Hash: `{prev_hash[:12]}`")
+                st.info("System would now execute 'dvc checkout' and update MLflow Production tags.")
+            else:
+                st.warning("No previous versions available for rollback.")
     else:
-        st.info("No training metadata available yet.")
+        st.info("No training metadata available yet. Run the training pipeline to generate lineage.")

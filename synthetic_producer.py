@@ -25,13 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOPIC = 'updates'
-
-if os.path.exists('/.dockerenv'):
-    KAFKA_SERVER = 'kafka:29092'
-    DB_URL = "postgresql+psycopg2://airflow:airflow@postgres:5432/airflow"
-else:
-    KAFKA_SERVER = 'localhost:9092'
-    DB_URL = "postgresql+psycopg2://airflow:airflow@localhost:5432/airflow"
+KAFKA_SERVER = 'kafka:29092' if os.path.exists('/.dockerenv') else 'localhost:9092'
+DB_URL = "postgresql+psycopg2://airflow:airflow@localhost:5432/airflow"
 
 SLEEP_DELAY = 10.0 if args.speed == 'slow' else (0.1, 0.4)
 
@@ -40,7 +35,7 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
-# --- SURGICAL ADDITION: CHAOS ENGINE ---
+# --- 2. SURGICAL FIX: CHAOS ENGINE ---
 def generate_chaos_event(p_id, u_id):
     chaos_type = random.choice(['missing_fields', 'wrong_types'])
     if chaos_type == 'missing_fields':
@@ -49,106 +44,98 @@ def generate_chaos_event(p_id, u_id):
         return {
             "type": "order_transaction",
             "order_id": str(uuid.uuid4()),
+            "session_id": f"CHAOS-{str(uuid.uuid4())[:4]}", # FIX: session_id prevents SQL crash
             "total_amount": "MALFORMED_PRICE_$$",
             "product_id": p_id,
-            "user_id": u_id
-        }
-
-# --- 2. SEEDING LOGIC (UNTOUCHED) ---
-def seed_reviews(product_ids, user_ids, label="Baseline"):
-    logger.info(f"🌟 SEEDING [{label}]: Creating reviews for {len(product_ids)} products...")
-    target_count = max(len(product_ids), 10)
-    for i in range(target_count):
-        p_id = product_ids[i % len(product_ids)]
-        u_id = random.choice(user_ids)
-        review_event = {
-            "type": "product_review",
-            "review_id": str(uuid.uuid4()),
-            "product_id": p_id,
             "user_id": u_id,
-            "rating": float(random.randint(3, 5)),
-            "review_text": f"{label} system initialization review.",
-            "review_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
-        producer.send(TOPIC, review_event)
-    producer.flush()
 
-# --- 3. DATABASE SYNC & REFRESH (UNTOUCHED) ---
-def fetch_metadata_and_check_status():
+# --- 3. DYNAMIC CSV GROWTH THREAD (Slow Growth) ---
+def background_csv_growth(cities):
+    """Adds 10 users and 5 products per 24h cycle to the local CSV files."""
+    logger.info("🧵 Growth thread active: 24h target cycle.")
+    categories = ["Electronics", "Home Office", "Wearables", "Audio", "Gaming"]
+    minutes_elapsed = 0
+    
+    while True:
+        time.sleep(60)
+        minutes_elapsed += 1
+
+        # ADD USER (Target: ~10 per day)
+        if minutes_elapsed % 144 == 0:
+            new_uid = f"U{random.randint(100000, 999999)}"
+            city = random.choice(cities) if cities else "New York"
+            try:
+                with open('users.csv', 'a') as f:
+                    f.write(f"\n{new_uid},New User,Organic,{city},2026-01-19")
+                logger.info(f"👤 [CSV Growth] Added {new_uid}")
+            except: pass
+
+        # ADD PRODUCT (Target: ~5 per day)
+        if minutes_elapsed % 288 == 0:
+            new_pid = f"P{random.randint(100000, 999999)}"
+            price = round(random.uniform(29.99, 899.99), 2)
+            try:
+                with open('products.csv', 'a') as f:
+                    f.write(f"\n{new_pid},Growth Item,{random.choice(categories)},RecomArt,{price},4.0")
+                logger.info(f"📦 [CSV Growth] Added {new_pid}")
+            except: pass
+
+        if minutes_elapsed >= 1440: minutes_elapsed = 0
+
+# --- 4. METADATA REFRESHER (Silent Sync) ---
+def run_invisible_refresh(p_ids, u_ids):
     engine = create_engine(DB_URL)
     while True:
+        time.sleep(30)
         try:
             with engine.connect() as conn:
-                logger.info("🔍 Checking database for products and users...")
-                products = conn.execute(text("SELECT product_id FROM products")).scalars().all()
-                users = conn.execute(text("SELECT user_id FROM users")).scalars().all()
-                cities = conn.execute(text("SELECT DISTINCT city FROM users WHERE city IS NOT NULL")).scalars().all()
-                if products and users:
-                    count = conn.execute(text("SELECT COUNT(*) FROM product_feature_store")).scalar()
-                    return list(products), list(users), list(cities), (count == 0)
-                time.sleep(10)
-        except Exception as e:
-            logger.error(f"📡 DB Connection Pending: {e}"); time.sleep(5)
+                db_p = set(conn.execute(text("SELECT product_id FROM products")).scalars().all())
+                db_u = set(conn.execute(text("SELECT user_id FROM users")).scalars().all())
+                
+                for pid in (db_p - set(p_ids)): p_ids.append(pid)
+                for uid in (db_u - set(u_ids)): u_ids.append(uid)
+        except: pass
 
-# --- 4. LIVE TRAFFIC (FIXED: INDEPENDENT EVENTS) ---
+# --- 5. LIVE TRAFFIC LOOP ---
 def run_live_traffic(product_ids, user_ids, cities):
-    logger.info(f"🚀 Live traffic active | Speed: {args.speed} | Chaos: {args.chaos*100}%")
-
-    mid_p = len(product_ids) // 2
-    cat_alpha = product_ids[:mid_p]
-    cat_beta = product_ids[mid_p:]
-
-    pos_txt = ["Great quality", "Excellent!", "Loved it.", "Amazing purchase"]
-    neg_txt = ["Bad experience", "Broken", "Waste of money", "Returning this"]
+    logger.info(f"🚀 Live traffic active | Speed: {args.speed}")
+    
+    pos_txt = ["Great quality", "Excellent!", "Loved it."]
+    neg_txt = ["Bad experience", "Broken", "Waste of money"]
 
     while True:
-        # --- PART A: INDEPENDENT CHAOS ---
+        # Chaos Injection
         if random.random() < args.chaos:
-            bad_event = generate_chaos_event(random.choice(product_ids), random.choice(user_ids))
-            producer.send(TOPIC, bad_event)
-            logger.warning(f"☣️ Chaos Injected: {bad_event['type']}")
+            bad_ev = generate_chaos_event(random.choice(product_ids), random.choice(user_ids))
+            producer.send(TOPIC, bad_ev)
+            logger.warning("☣️ Chaos Injected")
 
-        # --- PART B: STANDARD TRAFFIC (Always runs alongside chaos) ---
+        # Standard Logic
         u_id = random.choice(user_ids)
+        p_id = random.choice(product_ids)
         session_id = str(uuid.uuid4())[:8]
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        # Persona Logic
-        is_alpha_user = int(str(u_id)[-2:]) <= 25
-        preferred_cat = cat_alpha if is_alpha_user else cat_beta
-        other_cat = cat_beta if is_alpha_user else cat_alpha
-        p_id = random.choice(preferred_cat) if random.random() < 0.8 else random.choice(other_cat)
-        is_preferred_hit = (p_id in preferred_cat)
-
-        # STEP 1: Clickstream (View)
+        # VIEW
         producer.send(TOPIC, {
             "type": "click", "event_id": str(uuid.uuid4()), "session_id": session_id,
             "user_id": u_id, "product_id": p_id, "event_type": "view", "timestamp": ts
         })
-        logger.info(f"📤 SENT: View | User: {u_id} | Product: {p_id}")
 
-        # STEP 2: Optional Add to Cart
-        cart_prob = 0.60 if is_preferred_hit else 0.15
-        added_to_cart = False
-        if random.random() < cart_prob:
-            added_to_cart = True
-            producer.send(TOPIC, {
-                "type": "click", "event_id": str(uuid.uuid4()), "session_id": session_id,
-                "user_id": u_id, "product_id": p_id, "event_type": "add_to_cart", "timestamp": ts
-            })
-
-        # STEP 3: Transaction or Review
-        event_roll = random.random()
-        if (added_to_cart and event_roll < 0.70) or (not added_to_cart and event_roll < 0.05):
+        # PURCHASE (Funnel Logic)
+        if random.random() < 0.25:
             producer.send(TOPIC, {
                 "type": "order_transaction", "order_id": str(uuid.uuid4()),
                 "session_id": session_id, "product_id": p_id, "user_id": u_id,
                 "total_amount": float(round(random.uniform(15.0, 450.0), 2)), "timestamp": ts
             })
-            logger.info(f"💰 SENT: Purchase | User: {u_id}")
+            logger.info(f"💰 Purchase: {u_id} | Session: {session_id}")
 
-        elif event_roll > 0.85:
-            rating = float(random.randint(4, 5)) if is_preferred_hit else float(random.randint(1, 3))
+        # REVIEW
+        elif random.random() < 0.10:
+            rating = float(random.randint(1, 5))
             txt = random.choice(pos_txt) if rating > 3 else random.choice(neg_txt)
             producer.send(TOPIC, {
                 "type": "product_review", "review_id": str(uuid.uuid4()),
@@ -159,6 +146,18 @@ def run_live_traffic(product_ids, user_ids, cities):
         time.sleep(random.uniform(*SLEEP_DELAY) if isinstance(SLEEP_DELAY, tuple) else SLEEP_DELAY)
 
 if __name__ == "__main__":
-    p_ids, u_ids, cities, is_db_empty = fetch_metadata_and_check_status()
-    if is_db_empty: seed_reviews(p_ids, u_ids, label="Baseline")
+    engine = create_engine(DB_URL)
+    while True:
+        try:
+            with engine.connect() as conn:
+                p_ids = list(conn.execute(text("SELECT product_id FROM products")).scalars().all())
+                u_ids = list(conn.execute(text("SELECT user_id FROM users")).scalars().all())
+                cities = list(conn.execute(text("SELECT DISTINCT city FROM users WHERE city IS NOT NULL")).scalars().all())
+                if p_ids and u_ids: break
+            time.sleep(10)
+        except: time.sleep(5)
+
+    threading.Thread(target=run_invisible_refresh, args=(p_ids, u_ids), daemon=True).start()
+    threading.Thread(target=background_csv_growth, args=(cities,), daemon=True).start()
+    
     run_live_traffic(p_ids, u_ids, cities)
