@@ -21,7 +21,7 @@ else:
 
 engine = create_engine(DB_URL)
 
-# --- 2. DATA RETRIEVAL FUNCTIONS (Preserving All Logic) ---
+# --- 2. DATA RETRIEVAL FUNCTIONS ---
 def get_live_inventory_stats():
     try:
         n_users = pd.read_sql("SELECT COUNT(*) FROM users", engine).iloc[0,0]
@@ -30,8 +30,18 @@ def get_live_inventory_stats():
         return n_users, n_prods, n_reviews
     except: return 0, 0, 0
 
+def get_detailed_metrics():
+    """Pulls Precision, Recall, and RMSE from the model health store."""
+    try:
+        query = """
+            SELECT training_date as date, rmse, precision, recall, f1_score 
+            FROM model_health_logs 
+            ORDER BY training_date ASC
+        """
+        return pd.read_sql(query, engine)
+    except: return pd.DataFrame()
+
 def get_deep_analytics_data():
-    """Combined Join: Merges Reviews, Users, and Products for deep EDA."""
     try:
         query = """
             SELECT r.user_id, r.product_id, r.rating, r.review_date,
@@ -45,22 +55,6 @@ def get_deep_analytics_data():
         df['review_date'] = pd.to_datetime(df['review_date'])
         return df
     except: return pd.DataFrame()
-
-def get_mlflow_history():
-    if os.path.exists(MLFLOW_DB):
-        try:
-            conn = sqlite3.connect(MLFLOW_DB)
-            df = pd.read_sql("""
-                SELECT m.value as rmse, r.start_time, r.run_uuid, t.value as data_source
-                FROM metrics m 
-                JOIN runs r ON m.run_uuid = r.run_uuid
-                LEFT JOIN tags t ON r.run_uuid = t.run_uuid AND t.key = 'data_source'
-            """, conn)
-            conn.close()
-            df['date'] = pd.to_datetime(df['start_time'], unit='ms')
-            return df
-        except: return pd.DataFrame()
-    return pd.DataFrame()
 
 def get_feature_store_data():
     try:
@@ -78,16 +72,27 @@ st.title("🚀 RecoMart V3: End-to-End MLOps Intelligence")
 # --- TOP LEVEL METRIC CARDS ---
 n_u, n_p, n_r = get_live_inventory_stats()
 sparsity = round((1 - (n_r / (n_u * n_p if n_u*n_p > 0 else 1))) * 100, 2)
+metrics_df = get_detailed_metrics()
 
+# Main Row Metrics
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Catalog Users", f"{n_u:,}")
 m2.metric("Total Products", f"{n_p:,}")
 m3.metric("Live Interactions", f"{n_r:,}")
 m4.metric("Matrix Sparsity", f"{sparsity}%")
 
+# Sub-Row Metrics (Precision & Recall)
+if not metrics_df.empty:
+    latest = metrics_df.iloc[-1]
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Model Precision", f"{round(latest['precision']*100, 2)}%")
+    s2.metric("Model Recall", f"{round(latest['recall']*100, 2)}%")
+    s3.metric("F1-Score", f"{round(latest['f1_score'], 3)}")
+    s4.metric("Current RMSE", f"{round(latest['rmse'], 4)}")
+
 st.divider()
 
-# --- SIDEBAR: PERSONALIZATION & SYSTEM OPS ---
+# --- SIDEBAR ---
 st.sidebar.header("🎯 AI Personalization")
 try:
     user_list = pd.read_sql("SELECT DISTINCT user_id FROM users LIMIT 50", engine)['user_id'].tolist()
@@ -96,7 +101,6 @@ try:
         m_path = os.path.join(MODEL_ROOT, "svd_v1.pkl")
         if os.path.exists(m_path):
             _, algo = dump.load(m_path)
-            # Pull candidates from feature store for sentiment-aware ranking
             prods = pd.read_sql("SELECT p.product_id, p.product_name, f.avg_sentiment FROM products p LEFT JOIN product_feature_store f ON p.product_id = f.product_id", engine)
             prods['score'] = prods.apply(lambda x: (algo.predict(str(sel_user), str(x['product_id'])).est * 0.7) + ((x['avg_sentiment'] or 0) * 0.3), axis=1)
             st.sidebar.table(prods.sort_values('score', ascending=False).head(5)[['product_name', 'score']])
@@ -104,10 +108,9 @@ except: st.sidebar.info("Sync users to enable AI picks.")
 
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ System Status")
-st.sidebar.write(f"**Model Directory:** `{MODEL_ROOT}`")
 st.sidebar.write(f"**DB Status:** Connected ✅")
 
-# --- 4. MAIN DASHBOARD TABS (All Features Unified) ---
+# --- 4. MAIN DASHBOARD TABS ---
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Business Intelligence", "🔬 Deep Analytics", "📉 Model Drift", 
     "⚡ Live Funnel", "🔍 Data Health", "📜 Audit Log"
@@ -125,18 +128,13 @@ with tab2:
     st.subheader("🔬 Region & Category Drill-down")
     df_adv = get_deep_analytics_data()
     if not df_adv.empty:
-        # HEATMAP (Requested Upgrade)
         st.write("#### 🔥 Category Interaction Heatmap (City-wise)")
         heatmap_data = df_adv.groupby(['city', 'category']).size().reset_index(name='interactions')
         st.plotly_chart(px.density_heatmap(heatmap_data, x="city", y="category", z="interactions", color_continuous_scale="Viridis", template="plotly_dark"), use_container_width=True)
 
         st.divider()
-        
-        # FIXED DROPDOWN (Filters out dates)
         city_options = sorted([c for c in df_adv['city'].unique() if "-" not in str(c)])
-        if not city_options: city_options = sorted(df_adv['city'].unique().tolist())
-        
-        selected_city = st.selectbox("📍 Select City for Local Insights", city_options)
+        selected_city = st.selectbox("📍 Select City for Local Insights", city_options if city_options else ["None"])
         filtered_df = df_adv[df_adv['city'] == selected_city]
         
         cl, cr = st.columns(2)
@@ -148,12 +146,17 @@ with tab2:
             st.plotly_chart(px.pie(filtered_df['category'].value_counts().reset_index(), names='category', values='count', hole=0.4, template="plotly_dark"), use_container_width=True)
 
 with tab3:
-    st.subheader("📉 Performance Drift (MLflow)")
-    h_df = get_mlflow_history()
-    if not h_df.empty:
-        fig_drift = px.line(h_df, x='date', y='rmse', markers=True, template="plotly_dark", title="RMSE Trend Line")
-        fig_drift.add_hline(y=1.45, line_dash="dot", line_color="red", annotation_text="Drift Threshold")
+    st.subheader("📉 Performance & Quality Drift")
+    if not metrics_df.empty:
+        # Relevance Chart
+        fig_quality = px.line(metrics_df, x='date', y=['precision', 'recall'], markers=True, template="plotly_dark", title="Precision & Recall Trend")
+        st.plotly_chart(fig_quality, use_container_width=True)
+        
+        # Error Chart
+        fig_drift = px.area(metrics_df, x='date', y='rmse', template="plotly_dark", title="RMSE (Lower is Better)")
+        fig_drift.add_hline(y=1.45, line_dash="dot", line_color="red", annotation_text="Drift Limit")
         st.plotly_chart(fig_drift, use_container_width=True)
+    else: st.info("No detailed training logs found in model_health_logs.")
 
 with tab4:
     st.subheader("⚡ Live Clickstream Funnel")
@@ -166,10 +169,10 @@ with tab5:
     st.subheader("🔍 Data Health & Sparsity")
     df_health = pd.read_sql("SELECT rating FROM reviews", engine)
     if not df_health.empty:
-        st.plotly_chart(px.histogram(df_health, x='rating', title="Rating Distribution", template="plotly_dark"), use_container_width=True)
+        st.plotly_chart(px.histogram(df_health, x='rating', title="Rating Distribution", template="plotly_dark", nbins=5), use_container_width=True)
 
 with tab6:
     st.subheader("📜 System Audit Log")
-    if not h_df.empty:
-        st.write("#### 🧪 Model Training History")
-        st.dataframe(h_df.sort_values('date', ascending=False), use_container_width=True)
+    if not metrics_df.empty:
+        st.write("#### 🧪 Detailed Model Health History")
+        st.dataframe(metrics_df.sort_values('date', ascending=False), use_container_width=True)

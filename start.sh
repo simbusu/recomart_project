@@ -9,75 +9,61 @@ export AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow
 export AIRFLOW__CORE__EXECUTOR=LocalExecutor
 export AIRFLOW__CORE__LOAD_EXAMPLES=False
 
-# MLflow Path Fixes (Preventing [Errno 13] /mlflow errors)
+# MLflow Path Fixes
 export MLFLOW_SET_DESTINATION=/home/ubuntu/recomart_project/mlruns
 export MLFLOW_TRACKING_URI=http://172.17.0.1:5000
 
-echo "🚀 Starting RecoMart with Data Versioning & Lineage..."
+echo "🚀 Starting RecoMart V3 Infrastructure..."
 
 # --- 2. ENVIRONMENT REFRESH ---
 cd $AIRFLOW_HOME
-if [ -f "venv/bin/activate" ]; then
-    source venv/bin/activate
-else
-    echo "❌ Virtual environment not found. Please create it first."
-    exit 1
-fi
+source venv/bin/activate
 
 echo -n "📦 Synchronizing Python dependencies... "
-# Added 'dvc' and 'pyyaml' to ensure the DAG can read version hashes
-pip install "numpy<2.0.0" pandas sqlalchemy nltk mlflow==2.15.1 dvc pyyaml scikit-surprise psycopg2-binary -q
+pip install "numpy<2.0.0" pandas sqlalchemy nltk mlflow==2.15.1 dvc pyyaml scikit-surprise psycopg2-binary streamlit plotly -q
 echo "✅ Done."
 
-# --- 2.5 DATA VERSIONING SYNC (Requirement 8) ---
-echo -n "🔗 Checking Data Lineage Sync (DVC)... "
-# Ensure DVC local storage exists
-mkdir -p /home/ubuntu/dvc_storage
-
-# Pull latest data versions based on .dvc pointer files in Git
-# This ensures your 'data_lake' folder matches your code version
+# --- 3. INFRASTRUCTURE & DATA SYNC ---
+echo -n "🔗 Syncing Data (DVC)... "
 dvc pull -q > /dev/null 2>&1
-echo "✅ Data Synced."
+echo "✅ Ready."
 
-# --- 3. INFRASTRUCTURE (DOCKER) ---
-echo -n "🐳 Bringing up Docker Services (Postgres, Kafka, MLflow)... "
-# Restarting containers to ensure fresh volume mounts
+echo -n "🐳 Bringing up Docker Services (DB/Kafka/MLflow)... "
 docker compose up -d > /dev/null 2>&1
-
 until pg_isready -h localhost -p 5432 -U airflow > /dev/null 2>&1; do
     printf "."
     sleep 1
 done
 echo " ✅ Ready."
 
-# --- 4. DATABASE & AIRFLOW PREP ---
-echo -n "⚙️ Running Airflow Migrations & DB Init... "
+# --- 4. AIRFLOW PREP & START ---
+echo -n "⚙️ Migrating DB... "
 $VENV_BIN/airflow db migrate > /dev/null 2>&1
 $VENV_BIN/python3 init_db.py > /dev/null 2>&1
 echo "✅ Done."
 
-# --- 5. START AIRFLOW SERVICES ---
 echo "🌪️ Starting Airflow Standalone..."
-# Cleanup zombie processes to prevent port lock
 pkill -f "airflow" > /dev/null 2>&1
 rm -f $AIRFLOW_HOME/airflow-webserver.pid
-
 nohup $VENV_BIN/airflow standalone > airflow_standalone.log 2>&1 &
 
-echo -n "⏳ Waiting 20s for Web UI... "
-sleep 20
-echo "✅ Done."
-
-# --- 6. TRIGGER PIPELINE ---
-echo -n "🔓 Triggering RecoMart Pipeline... "
-# This triggers the DAG which now contains the MLflow tagging logic
+echo -n "⏳ Waiting for Pipeline Trigger... "
+sleep 15
 $VENV_BIN/airflow dags unpause recomart_full_pipeline > /dev/null 2>&1
 $VENV_BIN/airflow dags trigger recomart_full_pipeline > /dev/null 2>&1
 echo "✅ Done."
 
+# --- 5. START DASHBOARD ---
+echo "📈 Launching Production Dashboard..."
+pkill -f "streamlit" > /dev/null 2>&1
+nohup streamlit run appv2.py --server.port 8501 > streamlit.log 2>&1 &
+
 echo "------------------------------------------------------"
-echo "🌟 SERVICES ACTIVE & LINEAGE TRACKED"
-echo "Airflow UI:      http://3.16.158.217:8080"
-echo "MLflow Registry: http://3.16.158.217:5000"
-echo "Dashboard:       streamlit run appv1.py"
+echo "🌟 RECOMART V3 ACTIVE (Producer: MANUAL)"
+echo "Airflow:   http://3.16.158.217:8080"
+echo "MLflow:    http://3.16.158.217:5000"
+echo "Dashboard: http://3.16.158.217:8501"
+echo ""
+echo "👉 TO START LIVE TRAFFIC MANUALLY:"
+echo "python3 synthetic_producer.py --speed fast"
 echo "------------------------------------------------------"

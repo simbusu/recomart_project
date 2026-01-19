@@ -6,8 +6,6 @@ import time
 import pandas as pd
 import mlflow
 import numpy as np
-import subprocess
-import yaml
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -31,9 +29,9 @@ if os.path.exists('/.dockerenv') or os.path.exists('/opt/airflow'):
     MLFLOW_URI = "http://mlflow:5000"
 else:
     DB_URL = "postgresql+psycopg2://airflow:airflow@localhost:5432/airflow"
-    LAKE_ROOT = os.path.expanduser("~/recomart_project/data_lake")
+    LAKE_ROOT = "data_lake"
     NLTK_DATA_DIR = os.path.expanduser("~/recomart_project/nltk_data")
-    MODEL_DIR = os.path.expanduser("~/recomart_project/models")
+    MODEL_DIR = "models"
     MLFLOW_URI = "http://172.17.0.1:5000"
 
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -46,6 +44,37 @@ default_args = {
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
+
+# --- DASHBOARD BRIDGE HELPER ---
+def log_model_health_to_db(metrics):
+    """Surgically writes training results to the DB for dashboard tracking."""
+    try:
+        engine_db = create_engine(DB_URL)
+        with engine_db.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS model_health_logs (
+                    id SERIAL PRIMARY KEY,
+                    training_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    rmse REAL,
+                    precision REAL,
+                    recall REAL,
+                    f1_score REAL,
+                    model_version VARCHAR(50)
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO model_health_logs (rmse, precision, recall, f1_score, model_version)
+                VALUES (:rmse, :p, :r, :f1, :ver)
+            """), {
+                "rmse": metrics.get('rmse', 0.0),
+                "p": metrics.get('precision', 0.0),
+                "r": metrics.get('recall', 0.0),
+                "f1": metrics.get('f1', 0.0),
+                "ver": f"svd_v3_{datetime.now().strftime('%m%d_%H%M')}"
+            })
+        logger.info("📊 Model health metrics successfully pushed to Database via DAG.")
+    except Exception as e:
+        logger.warning(f"⚠️ Dashboard logging failed in DAG: {e}")
 
 # --- 1. INGESTION & HOUSEKEEPING ---
 def run_user_sync():
@@ -80,7 +109,7 @@ def validate_lake_data(**kwargs):
         raise ValueError("❌ Validation Failed: No event data found in lake.")
     logger.info(f"✅ Validation Passed: Found {len(found_files)} files.")
 
-# --- 3. PREPARATION & SENTIMENT (WITH DVC VERSIONING) ---
+# --- 3. PREPARATION & SENTIMENT ---
 def prepare_and_stage_data(**kwargs):
     import nltk
     from nltk.sentiment.vader import SentimentIntensityAnalyzer
@@ -104,103 +133,102 @@ def prepare_and_stage_data(**kwargs):
         df['rating'] = pd.to_numeric(df['rating'], errors='coerce').fillna(3.0).clip(1.0, 5.0)
         df['sentiment'] = df['review_text'].apply(lambda x: sid.polarity_scores(str(x))['compound'] if x else 0.0)
         df = df.drop_duplicates(subset=['user_id', 'product_id'], keep='last')
-
-        # --- REQUIREMENT 8: DVC VERSIONING ---
-        versioned_csv = os.path.join(LAKE_ROOT, "transformed_ratings.csv")
-        df.to_csv(versioned_csv, index=False)
-
-        data_hash = "unknown_hash"
-        try:
-            # Locate DVC binary in the current venv
-            dvc_bin = os.path.join(os.path.dirname(sys.executable), 'dvc')
-            
-            # Since data_lake/ is tracked, we update the whole folder
-            subprocess.run([dvc_bin, "add", LAKE_ROOT], check=True, capture_output=True)
-            
-            # Read hash from data_lake.dvc (parent of versioned_csv)
-            dvc_pointer = os.path.join(os.path.dirname(LAKE_ROOT), "data_lake.dvc")
-            
-            if os.path.exists(dvc_pointer):
-                with open(dvc_pointer, "r") as f:
-                    dvc_config = yaml.safe_load(f)
-                    data_hash = dvc_config['outs'][0]['md5']
-                logger.info(f"✅ DVC Versioning Successful: {data_hash}")
-            else:
-                logger.error(f"❌ DVC Pointer file not found: {dvc_pointer}")
-        except Exception as e:
-            logger.error(f"⚠️ DVC Error: {str(e)}")
-
-        kwargs['ti'].xcom_push(key='dvc_data_hash', value=data_hash)
-
-        engine = create_engine(DB_URL)
+        engine_db = create_engine(DB_URL)
         df[['product_id', 'user_id', 'rating', 'sentiment']].to_sql(
-            'temp_lake_ratings_raw', engine, if_exists='replace', index=False
+            'temp_lake_ratings_raw', engine_db, if_exists='replace', index=False
         )
     else:
         logger.warning("No reviews found to stage.")
 
-# --- 4. ML TRAINING & METADATA LINEAGE ---
-def train_collaborative_model(**kwargs):
-    from surprise import SVD, Dataset, Reader
-    from surprise.model_selection import cross_validate
+# --- 4. DYNAMIC ML TRAINING ---
+def train_collaborative_model():
+    from surprise import SVD, Dataset, Reader, dump, accuracy
+    from surprise.model_selection import train_test_split
     from mlflow.tracking import MlflowClient
     import mlflow.sklearn
 
-    ti = kwargs['ti']
-    dvc_hash = ti.xcom_pull(key='dvc_data_hash', task_ids='process_sentiment_scores') or "unknown_hash"
-
     mlflow.set_tracking_uri(MLFLOW_URI)
     mlflow.set_experiment("RecoMart_V3_System")
-    engine = create_engine(DB_URL)
+    engine_db = create_engine(DB_URL)
 
     try:
-        df = pd.read_sql("SELECT user_id, product_id, rating FROM temp_lake_ratings_raw", engine)
+        df = pd.read_sql("SELECT user_id, product_id, rating FROM temp_lake_ratings_raw", engine_db)
 
-        if len(df) > 5:
+        if len(df) > 10:
             run_name = f"SVD_Run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             with mlflow.start_run(run_name=run_name) as run:
                 reader = Reader(rating_scale=(1, 5))
                 data = Dataset.load_from_df(df[['user_id', 'product_id', 'rating']], reader)
+                
+                # Split for true performance evaluation
+                trainset, testset = train_test_split(data, test_size=0.2)
                 algo = SVD()
-                algo.fit(data.build_full_trainset())
+                algo.fit(trainset)
+                predictions = algo.test(testset)
 
-                cv_results = cross_validate(algo, data, measures=['RMSE'], cv=3)
-                mean_rmse = np.mean(cv_results['test_rmse'])
-                mlflow.log_metric("rmse", mean_rmse)
+                # Dynamic Metric Calculation
+                rmse_val = accuracy.rmse(predictions, verbose=False)
+                
+                # Calculate Precision and Recall at k=5
+                user_est_true = {}
+                for uid, _, true_r, est, _ in predictions:
+                    if uid not in user_est_true: user_est_true[uid] = []
+                    user_est_true[uid].append((est, true_r))
 
-                # --- REQUIREMENT 8: METADATA TRACKING (LINEAGE) ---
-                mlflow.set_tag("data_source", "Kafka-Data-Lake/Transformed-CSV")
-                mlflow.set_tag("ingestion_date", datetime.now().strftime("%Y-%m-%d"))
-                mlflow.set_tag("transformations", "Vader-Sentiment, Rating-Clipping, Deduplication")
-                mlflow.set_tag("dvc_hash", dvc_hash)
+                precisions, recalls = [], []
+                k, threshold = 5, 3.5
 
+                for uid, user_ratings in user_est_true.items():
+                    user_ratings.sort(key=lambda x: x[0], reverse=True)
+                    n_rel = sum((true_r >= threshold) for (_, true_r) in user_ratings)
+                    n_rec_k = sum((est >= threshold) for (est, _) in user_ratings[:k])
+                    n_rel_and_rec_k = sum(((true_r >= threshold) and (est >= threshold)) for (est, true_r) in user_ratings[:k])
+                    precisions.append(n_rel_and_rec_k / n_rec_k if n_rec_k != 0 else 0)
+                    recalls.append(n_rel_and_rec_k / n_rel if n_rel != 0 else 0)
+
+                dyn_precision = np.mean(precisions)
+                dyn_recall = np.mean(recalls)
+                f1_val = (2 * dyn_precision * dyn_recall) / (dyn_precision + dyn_recall) if (dyn_precision + dyn_recall) > 0 else 0
+
+                # Log to MLflow
+                mlflow.log_metrics({"precision": dyn_precision, "recall": dyn_recall, "rmse": rmse_val, "f1": f1_val})
                 mlflow.sklearn.log_model(sk_model=algo, artifact_path="svd-model")
 
-                model_name = "RecoMart_SVD_Model"
-                mv = mlflow.register_model(f"runs:/{run.info.run_id}/svd-model", model_name)
+                # Register Model
+                model_uri = f"runs:/{run.info.run_id}/svd-model"
+                mv = mlflow.register_model(model_uri, "RecoMart_SVD_Model")
 
-                client = MlflowClient()
-                client.set_model_version_tag(model_name, mv.version, "data_lineage", dvc_hash)
-                logger.info(f"✅ Model Registered with Data Lineage: {dvc_hash}")
+                # SYNC TO DASHBOARD
+                db_metrics = {
+                    "rmse": round(float(rmse_val), 4),
+                    "precision": round(float(dyn_precision), 4),
+                    "recall": round(float(dyn_recall), 4),
+                    "f1": round(float(f1_val), 4)
+                }
+                log_model_health_to_db(db_metrics)
 
+                # Export local artifacts for Streamlit
+                with open(os.path.join(MODEL_DIR, "latest_metrics.json"), "w") as f:
+                    json.dump({"precision": round(dyn_precision, 2), "recall": round(dyn_recall, 2), "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
+                
+                dump.dump(os.path.join(MODEL_DIR, "svd_v1.pkl"), algo=algo)
+                logger.info(f"✅ ML Training complete. Precision: {dyn_precision:.2f}, Recall: {dyn_recall:.2f}")
+        else:
+            logger.warning("Insufficient data for dynamic training evaluation.")
     except Exception as e:
         logger.error(f"❌ ML Training error: {str(e)}")
 
 # --- 5. FEATURE STORE ---
 def transform_to_feature_store():
-    engine = create_engine(DB_URL)
+    engine_db = create_engine(DB_URL)
     upsert_query = text("""
         INSERT INTO product_feature_store (product_id, total_sales, avg_sentiment, review_count, updated_at)
         SELECT 
-            p.product_id, 
-            COALESCE(pfs.total_sales, 0),
-            COALESCE(lake.avg_sent, 0),
-            COALESCE(lake.cnt, 0),
-            NOW()
+            p.product_id, COALESCE(pfs.total_sales, 0), COALESCE(lake.avg_sent, 0), COALESCE(lake.cnt, 0), NOW()
         FROM products p
         LEFT JOIN product_feature_store pfs ON p.product_id = pfs.product_id
         LEFT JOIN (
-            SELECT product_id, AVG(sentiment) as avg_sent, COUNT(*) as cnt
+            SELECT product_id, AVG(sentiment) as avg_sent, COUNT(*) as cnt 
             FROM temp_lake_ratings_raw GROUP BY product_id
         ) lake ON p.product_id = lake.product_id
         ON CONFLICT (product_id) DO UPDATE SET
@@ -208,15 +236,16 @@ def transform_to_feature_store():
             review_count = EXCLUDED.review_count,
             updated_at = NOW();
     """)
-    with engine.begin() as conn:
+    with engine_db.begin() as conn:
         conn.execute(upsert_query)
 
+# --- 6. CONTENT SIMILARITY ---
 def generate_content_similarity():
     import pickle
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
-    engine = create_engine(DB_URL)
-    df_p = pd.read_sql("SELECT product_id, product_name FROM products", engine)
+    engine_db = create_engine(DB_URL)
+    df_p = pd.read_sql("SELECT product_id, product_name FROM products", engine_db)
     if not df_p.empty:
         tfidf = TfidfVectorizer(stop_words='english')
         tfidf_matrix = tfidf.fit_transform(df_p['product_name'])
@@ -230,7 +259,8 @@ with DAG(
     default_args=default_args,
     schedule='@daily',
     catchup=False,
-    tags=['recomart', 'mlops', 'lineage']
+    is_paused_upon_creation=False,
+    tags=['recomart', 'mlops', 'metadata']
 ) as dag:
 
     initialize_database = PythonOperator(task_id='initialize_database', python_callable=setup_database)
